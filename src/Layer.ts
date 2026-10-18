@@ -3,6 +3,7 @@ import type { ContainerConfig } from './Container.ts';
 import { Container } from './Container.ts';
 import { Node } from './Node.ts';
 import { Factory } from './Factory.ts';
+import { getBooleanValidator } from './Validators.ts';
 import { SceneCanvas, HitCanvas } from './Canvas.ts';
 import type { Stage } from './Stage.ts';
 
@@ -15,6 +16,7 @@ import { DD } from './DragAndDrop.ts';
 
 export interface LayerConfig extends ContainerConfig {
   clearBeforeDraw?: boolean;
+  partialRedraw?: boolean;
   hitGraphEnabled?: boolean;
   imageSmoothingEnabled?: boolean;
 }
@@ -25,7 +27,61 @@ const BEFORE_DRAW = 'beforeDraw',
   // getIntersection() reads the hit canvas around an edge pixel in blocks
   // of this radius, doubling it as long as the search goes on
   HIT_SEARCH_RADIUS = 10,
-  HIT_SEARCH_MAX_DISTANCE = 256;
+  HIT_SEARCH_MAX_DISTANCE = 256,
+  // more dirty regions than this are merged into one, as every region costs
+  // a clip path entry and a culling test per node
+  MAX_DIRTY_REGIONS = 8,
+  // a partial redraw of most of the canvas costs as much as a full one
+  MAX_DIRTY_AREA_SHARE = 0.6,
+  // see _collectDirtyRegions
+  MAX_ABSORB_PASSES = 3,
+  MAX_ABSORB_GROWTH = 3;
+
+function intersects(a: IRect, b: IRect) {
+  return (
+    a.x <= b.x + b.width &&
+    b.x <= a.x + a.width &&
+    a.y <= b.y + b.height &&
+    b.y <= a.y + a.height
+  );
+}
+
+function contains(outer: IRect, inner: IRect) {
+  return (
+    inner.x >= outer.x &&
+    inner.y >= outer.y &&
+    inner.x + inner.width <= outer.x + outer.width &&
+    inner.y + inner.height <= outer.y + outer.height
+  );
+}
+
+// merges the regions that touch, dropping empty ones
+function mergeRegions(rects: IRect[]) {
+  const regions: IRect[] = [];
+  for (let region of rects) {
+    if (!(region.width > 0 && region.height > 0)) continue;
+    for (let i = regions.length - 1; i >= 0; i--) {
+      if (intersects(region, regions[i])) {
+        region = union(region, regions[i]);
+        regions.splice(i, 1);
+        i = regions.length;
+      }
+    }
+    regions.push(region);
+  }
+  return regions;
+}
+
+function union(a: IRect, b: IRect): IRect {
+  const x = Math.min(a.x, b.x),
+    y = Math.min(a.y, b.y);
+  return {
+    x,
+    y,
+    width: Math.max(a.x + a.width, b.x + b.width) - x,
+    height: Math.max(a.y + a.height, b.y + b.height) - y,
+  };
+}
 
 // the shape drawn at a pixel of the hit graph: an opaque pixel, or an edge
 // pixel that the shape covers by at least half, so that its colour read back
@@ -45,6 +101,7 @@ function getHitShape(data: Uint8ClampedArray, i: number) {
  * @param {Object} config
  * @param {Boolean} [config.clearBeforeDraw] set this property to false if you don't want
  * to clear the canvas before each layer draw.  The default value is true.
+ * @param {Boolean} [config.partialRedraw] redraw only the areas that changed. See {@link Konva.Layer#partialRedraw}
  * @@nodeParams
  * @@containerParams
  * @example
@@ -61,8 +118,26 @@ export class Layer extends Container<Group | Shape> {
 
   _waitingForDraw = false;
 
+  // partialRedraw bookkeeping. Measured bounds are valid for one epoch, which
+  // ends with every full draw, because only tracked changes keep them current
+  _paintEpoch: object = {};
+  _fullDrawPending = true;
+  _dirtyNodes = new Set<Node>();
+  _dirtyRects: IRect[] = [];
+  // the hit graph missed changes because it was skipped during a drag or
+  // transform, so the next hit draw can not be partial
+  _hitStale = false;
+  // transformers with a deferred layout update, run before the dirty regions
+  // are measured, so a draw that skips them still shows their new layout
+  _pendingUpdates = new Set<{ _syncUpdate(): void }>();
+
   constructor(config?: LayerConfig) {
     super(config);
+    if (this.partialRedraw()) Node._partialRedrawUsed = true;
+    this.on('partialRedrawChange.konva', () => {
+      if (this.partialRedraw()) Node._partialRedrawUsed = true;
+      this._fullDrawPending = true;
+    });
     this.on('visibleChange.konva', this._checkVisibility);
     this._checkVisibility();
 
@@ -118,6 +193,7 @@ export class Layer extends Container<Group | Shape> {
    * layer.clear({ x: 0, y: 0, width: 100, height: 100 });
    */
   clear(bounds?: IRect) {
+    this._fullDrawPending = true;
     this.getContext().clear(bounds);
     this.getHitCanvas().getContext().clear(bounds);
     return this;
@@ -226,6 +302,8 @@ export class Layer extends Container<Group | Shape> {
   // the canvases follow the stage size. The public size() of a layer, like
   // width() and height(), warns and does nothing
   _setSize({ width, height }) {
+    // resizing wipes the canvas
+    this._fullDrawPending = true;
     this.canvas.setSize(width, height);
     this._syncHitCanvasSize();
     this._setSmoothEnabled();
@@ -318,6 +396,13 @@ export class Layer extends Container<Group | Shape> {
    * @return {Konva.Layer} this
    */
   batchDraw() {
+    // the caller may have changed something that is not tracked, like the
+    // pixels of a drawn image, so the whole layer is drawn
+    this._fullDrawPending = true;
+    return this._batchDrawChanges();
+  }
+  // like batchDraw(), but with partialRedraw only the changed areas are drawn
+  _batchDrawChanges() {
     if (!this._waitingForDraw) {
       this._waitingForDraw = true;
       // ask the window the stage is rendered in for the frame: a stage in a
@@ -326,12 +411,196 @@ export class Layer extends Container<Group | Shape> {
         // reset before drawing, so a throwing draw does not freeze the layer
         // and a draw handler can request the next frame
         this._waitingForDraw = false;
-        this.draw();
+        this._drawChanges();
       }, this.getStage()?._getOwnerWindow());
     }
     return this;
   }
-
+  draw() {
+    this._fullDrawPending = true;
+    return this._drawChanges();
+  }
+  _drawChanges() {
+    for (const node of this._pendingUpdates) node._syncUpdate();
+    this._pendingUpdates.clear();
+    const regions =
+      this._fullDrawPending ||
+      !this.partialRedraw() ||
+      !this.clearBeforeDraw() ||
+      !this.canvas.width ||
+      !this.canvas.height
+        ? null
+        : this._collectDirtyRegions();
+    this._fullDrawPending = false;
+    this._dirtyNodes.clear();
+    this._dirtyRects = [];
+    if (!regions) {
+      this._paintEpoch = {};
+      return super.draw();
+    }
+    if (regions.length) {
+      this._drawRegions(this.canvas, regions, () => this.drawScene());
+    }
+    if (this._hitStale) {
+      this.drawHit();
+    } else if (regions.length) {
+      this._drawRegions(this.hitCanvas, regions, () => this.drawHit());
+    }
+    return this;
+  }
+  // records the area a node painted before it changes, see partialRedraw()
+  _invalidate(node: Node) {
+    // undefined while the Node constructor sets attributes, before the
+    // fields of the layer exist; the first draw is a full one anyway
+    if (this._fullDrawPending !== false || this._dirtyNodes.has(node)) {
+      return;
+    }
+    if (node === this) {
+      this._fullDrawPending = true;
+      return;
+    }
+    // a cached ancestor keeps showing its bitmap until it is cached again
+    for (let p = node.parent; p && p !== this; p = p.parent) {
+      if (p.isCached()) return;
+    }
+    const rect = node.isVisible()
+      ? node._getPaintRect(this._paintEpoch)
+      : undefined;
+    if (rect === null) {
+      this._fullDrawPending = true;
+      return;
+    }
+    if (rect) this._dirtyRects.push(rect);
+    this._dirtyNodes.add(node);
+    node._forgetPaint();
+    for (let p = node.parent; p && p !== this; p = p.parent) {
+      p._paintEpoch = undefined;
+    }
+  }
+  // old and new areas of the changed nodes, merged and clamped to the
+  // canvas, or null when a full draw is needed
+  _collectDirtyRegions(): IRect[] | null {
+    const rects = this._dirtyRects;
+    for (const node of this._dirtyNodes) {
+      if (node.getLayer() !== this || !node.isVisible()) continue;
+      let cached = false;
+      for (let p = node.parent; p && p !== this; p = p.parent) {
+        if (p.isCached()) cached = true;
+      }
+      if (cached) continue;
+      const rect = node._getPaintRect(this._paintEpoch);
+      if (rect === null) return null;
+      if (rect) rects.push(rect);
+    }
+    const width = this.getWidth() || 0,
+      height = this.getHeight() || 0;
+    const clamp = (rect: IRect) => {
+      const x = Math.max(0, rect.x),
+        y = Math.max(0, rect.y);
+      return {
+        x,
+        y,
+        width: Math.min(width, rect.x + rect.width) - x,
+        height: Math.min(height, rect.y + rect.height) - y,
+      };
+    };
+    let regions = mergeRegions(rects.map(clamp));
+    // Chrome rasterizes a shape that crosses the border of a clip with
+    // different antialiasing than without the clip, while a shape inside the
+    // clip comes out the same. So regions grow over the shapes crossing them,
+    // within a budget of area: a shape too large for it keeps slightly
+    // different edges inside the region until the next full draw
+    const area = (list: IRect[]) =>
+      list.reduce((sum, r) => sum + r.width * r.height, 0);
+    let budget = area(regions) * MAX_ABSORB_GROWTH;
+    for (let pass = 0; pass < MAX_ABSORB_PASSES; pass++) {
+      let grown = false;
+      const visit = (container: Container) => {
+        for (const child of container.children) {
+          const paint = child._getPaintRect(this._paintEpoch);
+          if (!paint) continue;
+          const rect = clamp(paint);
+          for (let i = 0; i < regions.length; i++) {
+            const region = regions[i];
+            if (!intersects(rect, region) || contains(region, rect)) continue;
+            if (child instanceof Container && !child.isCached()) {
+              visit(child);
+              break;
+            }
+            const bigger = union(region, rect);
+            const cost =
+              bigger.width * bigger.height - region.width * region.height;
+            if (cost <= budget) {
+              budget -= cost;
+              regions[i] = bigger;
+              grown = true;
+            }
+          }
+        }
+      };
+      visit(this);
+      if (!grown) break;
+      regions = mergeRegions(regions);
+    }
+    if (regions.length > MAX_DIRTY_REGIONS) {
+      regions = [regions.reduce(union)];
+    }
+    if (area(regions) > width * height * MAX_DIRTY_AREA_SHARE) {
+      return null;
+    }
+    return regions;
+  }
+  // clips the canvas to the regions, widened to whole device pixels so that
+  // the edges of the clip are not antialiased, and lets draw() clear and
+  // paint only there, skipping the nodes outside of them
+  _drawRegions(
+    canvas: SceneCanvas | HitCanvas,
+    regions: IRect[],
+    draw: () => void
+  ) {
+    if (!canvas.width || !canvas.height) {
+      return;
+    }
+    const ratio = canvas.getPixelRatio(),
+      context = canvas.getContext()._context,
+      clipped: IRect[] = [];
+    context.save();
+    context.beginPath();
+    for (const r of regions) {
+      // one more pixel for antialiasing that leaks past the measured bounds
+      const x = Math.floor(r.x * ratio) - 1,
+        y = Math.floor(r.y * ratio) - 1,
+        rect = {
+          x: x / ratio,
+          y: y / ratio,
+          width: (Math.ceil((r.x + r.width) * ratio) + 1 - x) / ratio,
+          height: (Math.ceil((r.y + r.height) * ratio) + 1 - y) / ratio,
+        };
+      context.rect(rect.x, rect.y, rect.width, rect.height);
+      clipped.push(rect);
+    }
+    context.clip();
+    // cleared region by region instead of by the draw: some backends clear
+    // the whole canvas when clearRect() covers it, ignoring the clip. One
+    // pixel wider than the clip, as WebKit leaves the pixels on the border
+    // of the clip partly uncleared otherwise
+    const border = 1 / ratio;
+    for (const r of clipped) {
+      context.clearRect(
+        r.x - border,
+        r.y - border,
+        r.width + border * 2,
+        r.height + border * 2
+      );
+    }
+    canvas._partial = { regions: clipped, epoch: this._paintEpoch };
+    try {
+      draw();
+    } finally {
+      canvas._partial = undefined;
+      context.restore();
+    }
+  }
   /**
    * get visible intersection shape. This is the preferred
    * method for determining if a point intersects a shape or not.
@@ -434,7 +703,7 @@ export class Layer extends Container<Group | Shape> {
       node: this,
     });
 
-    if (this.clearBeforeDraw()) {
+    if (this.clearBeforeDraw() && !canvas._partial) {
       canvas.getContext().clear();
     }
 
@@ -477,9 +746,16 @@ export class Layer extends Container<Group | Shape> {
       // allocate or release the hit canvas to match the current listening
       // state - this also picks up a listening change made after the last draw
       layer._syncHitCanvasSize();
-      if (layer.clearBeforeDraw()) {
+      const skipped = !layer.shouldDrawHit();
+      // a skipped hit graph is cleared once and stays empty until redrawn
+      if (
+        layer.clearBeforeDraw() &&
+        !canvas._partial &&
+        !(skipped && layer._hitStale)
+      ) {
         layer.getHitCanvas().getContext().clear();
       }
+      layer._hitStale = skipped;
     }
 
     Container.prototype.drawHit.call(this, canvas, top);
@@ -550,6 +826,7 @@ export class Layer extends Container<Group | Shape> {
   hitGraphEnabled: GetSet<boolean, this>;
 
   clearBeforeDraw: GetSet<boolean, this>;
+  partialRedraw: GetSet<boolean, this>;
   imageSmoothingEnabled: GetSet<boolean, this>;
 }
 
@@ -591,6 +868,35 @@ Factory.addGetterSetter(Layer, 'imageSmoothingEnabled', true);
  * layer.clearBeforeDraw(true);
  */
 Factory.addGetterSetter(Layer, 'clearBeforeDraw', true);
+
+/**
+ * get/set partialRedraw flag. When enabled, a change of a node redraws only the
+ * area the node painted before and paints now, instead of the whole layer:
+ * the canvas is clipped to that area and nodes outside of it are skipped.
+ * The cost of a frame then depends on the size of the change, not on the size
+ * of the canvas. That matters most where canvas drawing is rasterized on the CPU,
+ * like Safari, and for large or high-resolution canvases.
+ *
+ * Changes made through Konva (attributes, adding, removing, reordering, caching) are
+ * tracked. `layer.draw()`, `layer.batchDraw()` and `Konva.Animation` still redraw the
+ * whole layer, as they may follow a change Konva can not see, like new pixels of an image.
+ * Call them after such a change, and avoid calling them after tracked changes.
+ *
+ * A change of a node whose painted area is not known also redraws the whole layer:
+ * a custom `sceneFunc` without `selfRectFunc`, a custom `hitFunc`, or a
+ * `globalCompositeOperation` that affects pixels outside the node, like `destination-in`.
+ * A layer with `clearBeforeDraw(false)` is always drawn whole.
+ * @name Konva.Layer#partialRedraw
+ * @method
+ * @param {Boolean} partialRedraw
+ * @returns {Boolean}
+ * @example
+ * var layer = new Konva.Layer({ partialRedraw: true });
+ *
+ * // moving the shape redraws only the area around its old and new position
+ * shape.x(shape.x() + 10);
+ */
+Factory.addGetterSetter(Layer, 'partialRedraw', false, getBooleanValidator());
 
 // the getter and setter are the deprecated ones above
 Factory.addOverloadedGetterSetter(Layer, 'hitGraphEnabled');

@@ -592,11 +592,12 @@ export class Transformer extends Group {
    * transformer.detach();
    */
   detach() {
+    this._capturePaint();
     this._nodes?.forEach((node) => this._detachNode(node));
     this._nodes = [];
     this._updatePending = false;
     this._resetTransformCache();
-    this.getLayer()?.batchDraw();
+    this.getLayer()?._batchDrawChanges();
   }
   /**
    * bind events to the Transformer. You can use events: `transform`, `transformstart`, `transformend`, `dragstart`, `dragmove`, `dragend`
@@ -612,6 +613,8 @@ export class Transformer extends Group {
    * });
    */
   _resetTransformCache(changedNode?: Node) {
+    // the transformer moves with the cached node rect, not through attributes
+    this._capturePaint();
     if (changedNode) this._nodeRectCache?.delete(changedNode);
     else this._nodeRectCache?.clear();
     this._clearCache(NODES_RECT);
@@ -634,6 +637,7 @@ export class Transformer extends Group {
     }
     if (!this._updatePending) {
       this._updatePending = true;
+      this.getLayer()?._pendingUpdates.add(this);
       // queued ahead of the draw the change requests, so that draw shows the
       // new layout. Updating inside the draw would request one more frame.
       Util.requestAnimFrame(
@@ -641,7 +645,7 @@ export class Transformer extends Group {
         this.getStage()?._getOwnerWindow()
       );
       // the transformer can be on another layer than the changed node
-      this.getLayer()?.batchDraw();
+      this.getLayer()?._batchDrawChanges();
     }
   }
   // Runs a deferred update before anything draws or measures the anchors.
@@ -884,6 +888,37 @@ export class Transformer extends Group {
         ctx.fillStrokeShape(shape);
       },
     });
+    // the sceneFunc paints the padding and the rotater line outside of the
+    // back's size, so partialRedraw gets these bounds instead
+    back._measurePaint = function () {
+      if (!this.visible()) return undefined;
+      const tr = this.getParent() as Transformer;
+      const padding = tr.padding();
+      const width = this.width();
+      const height = this.height();
+      let x1 = -padding,
+        y1 = -padding,
+        x2 = width + padding,
+        y2 = height + padding;
+      if (
+        tr.rotateEnabled() &&
+        tr.rotateLineVisible() &&
+        tr.rotateMode() !== 'corners'
+      ) {
+        const line = getRotaterLine(tr, width, height);
+        x1 = Math.min(x1, line.endX);
+        y1 = Math.min(y1, line.endY);
+        x2 = Math.max(x2, line.endX);
+        y2 = Math.max(y2, line.endY);
+      }
+      const stroke = this._getStrokePadding();
+      return this._transformedRect({
+        x: x1 - stroke,
+        y: y1 - stroke,
+        width: x2 - x1 + stroke * 2,
+        height: y2 - y1 + stroke * 2,
+      });
+    };
     this._back = back;
     this.add(back);
     this._proxyDrag(back);
@@ -1267,13 +1302,13 @@ export class Transformer extends Group {
       activeTransformers.delete(this);
       this._fire('transformend', { evt: e, target: node });
       // redraw layer to restore hit graph
-      this.getLayer()?.batchDraw();
+      this.getLayer()?._batchDrawChanges();
 
       if (node) {
         this._nodes.forEach((target) => {
           target._fire('transformend', { evt: e, target });
           // redraw layer to restore hit graph
-          target.getLayer()?.batchDraw();
+          target.getLayer()?._batchDrawChanges();
         });
       }
       this._movingAnchorName = null;
@@ -1486,11 +1521,12 @@ export class Transformer extends Group {
     this._resetTransformCache();
     this.update();
     layersToDraw.add(this.getLayer());
-    layersToDraw.forEach((layer) => layer && layer.batchDraw());
+    layersToDraw.forEach((layer) => layer && layer._batchDrawChanges());
   }
   // deferred to the batch flush when one is open, else synchronous
   _scheduleUpdate() {
     this._updatePending = true;
+    this.getLayer()?._pendingUpdates.add(this);
     Node._runAfterUpdateBatch(this._syncUpdate);
   }
   /**
@@ -1527,7 +1563,7 @@ export class Transformer extends Group {
         (node) => node.hasName('_anchor') && styleFunc(node)
       );
     }
-    this.getLayer()?.batchDraw();
+    this.getLayer()?._batchDrawChanges();
   }
 
   _updateElements(attrs: Box) {

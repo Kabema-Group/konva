@@ -34,6 +34,8 @@ export class Canvas {
   _logicalHeight = 0;
 
   isCache = false;
+  // set while a layer redraws only these regions; nodes outside are skipped
+  _partial?: { regions: IRect[]; epoch: object };
 
   constructor(config: ICanvasConfig) {
     const conf = config || {};

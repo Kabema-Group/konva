@@ -289,6 +289,11 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
   _subtreeObservers?: Set<SubtreeObserver>;
   // Number of registered observers. The ancestor walk is skipped while it is 0.
   static _subtreeObserverCount = 0;
+  // set once any layer uses partialRedraw, so other apps skip the tracking
+  static _partialRedrawUsed = false;
+  // what the node paints into its layer, measured in the layer's _paintEpoch
+  _paintEpoch?: object;
+  _paintRect?: IRect | null;
   _batchingTransformChange = false;
   _needClearTransformCache = false;
 
@@ -426,6 +431,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
    * node.clearCache();
    */
   clearCache() {
+    this._capturePaint();
     this._releaseCanvasCache();
     this._clearSelfAndDescendantCache();
     this._requestDraw();
@@ -482,6 +488,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
       hitCanvasPixelRatio?: number;
     }
   ) {
+    this._capturePaint();
     const conf = config || {};
     let rect = {} as IRect;
 
@@ -1069,6 +1076,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     const parent = this.getParent();
 
     if (parent && parent.children) {
+      this._capturePaint();
       parent.children.splice(this.index, 1);
       parent._setChildrenIndices();
       this.parent = null;
@@ -1425,6 +1433,9 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     return absoluteTransform.getTranslation();
   }
   setAbsolutePosition(pos: Vector2d) {
+    // measured before the transform is cleared below, which leaves stale
+    // transform caches behind until setPosition()
+    this._capturePaint();
     const { x, y, ...origTrans } = this._clearTransform();
 
     // don't clear translation
@@ -1542,6 +1553,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     const index = this.index,
       len = this.parent.children.length;
     if (index < len - 1) {
+      this._capturePaint();
       this.parent.children.splice(index, 1);
       this.parent.children.push(this);
       this.parent._setChildrenIndices();
@@ -1563,6 +1575,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     const index = this.index,
       len = this.parent.children.length;
     if (index < len - 1) {
+      this._capturePaint();
       this.parent.children.splice(index, 1);
       this.parent.children.splice(index + 1, 0, this);
       this.parent._setChildrenIndices();
@@ -1583,6 +1596,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     }
     const index = this.index;
     if (index > 0) {
+      this._capturePaint();
       this.parent.children.splice(index, 1);
       this.parent.children.splice(index - 1, 0, this);
       this.parent._setChildrenIndices();
@@ -1603,6 +1617,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     }
     const index = this.index;
     if (index > 0) {
+      this._capturePaint();
       this.parent.children.splice(index, 1);
       this.parent.children.unshift(this);
       this.parent._setChildrenIndices();
@@ -1625,6 +1640,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
       );
     }
     const index = this.index;
+    this._capturePaint();
     this.parent.children.splice(index, 1);
     this.parent.children.splice(zIndex, 0, this);
     this.parent._setChildrenIndices();
@@ -2499,12 +2515,55 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
       if (observers) for (const o of observers) o._onSubtreeChange(node);
     }
   }
-  _requestDraw() {
+  // invalidate is false when the caller already recorded what changed, like
+  // a container whose child list changed
+  _requestDraw(invalidate = true) {
     this.parent?._notifySubtreeChange();
     if (Konva.autoDrawEnabled) {
-      const drawNode = this.getLayer() || this.getStage();
-      drawNode?.batchDraw();
+      const layer = this.getLayer();
+      if (layer?.partialRedraw()) {
+        if (invalidate) layer._invalidate(this);
+        layer._batchDrawChanges();
+      } else {
+        (layer || this.getStage())?.batchDraw();
+      }
     }
+  }
+  // records what the node paints before a change, for partialRedraw
+  _capturePaint() {
+    if (!Node._partialRedrawUsed) return;
+    const layer = this.getLayer();
+    if (layer?.partialRedraw()) layer._invalidate(this);
+  }
+  /**
+   * The absolute bounds of what the node paints into its layer canvas and hit
+   * canvas, measured once per epoch. undefined if it paints nothing, null if
+   * the bounds are not known.
+   */
+  _getPaintRect(epoch: object): IRect | null | undefined {
+    if (this._paintEpoch !== epoch) {
+      this._paintRect = this._measurePaint(epoch);
+      this._paintEpoch = epoch;
+    }
+    return this._paintRect;
+  }
+  _measurePaint(_epoch: object): IRect | null | undefined {
+    return null;
+  }
+  _forgetPaint() {
+    this._paintEpoch = undefined;
+  }
+  _paintsInto(partial: { regions: IRect[]; epoch: object }) {
+    const rect = this._getPaintRect(partial.epoch);
+    if (rect === null) return true;
+    if (!rect) return false;
+    return partial.regions.some(
+      (r) =>
+        rect.x <= r.x + r.width &&
+        r.x <= rect.x + rect.width &&
+        rect.y <= r.y + r.height &&
+        r.y <= rect.y + rect.height
+    );
   }
   _setAttr<AttrConfig extends Config, K extends AnyString<keyof Config>>(
     key: K,
@@ -2514,6 +2573,7 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
     if (oldVal === val && !Util.isObject(val)) {
       return;
     }
+    this._capturePaint();
     if (val === undefined || val === null) {
       delete this.attrs[key];
     } else {

@@ -1,4 +1,5 @@
 import type { Container } from './Container.ts';
+import type { Layer } from './Layer.ts';
 import type { Node } from './Node.ts';
 import type { Stage } from './Stage.ts';
 import type { Vector2d } from './types.ts';
@@ -225,7 +226,12 @@ export const DD = {
     // because mousemove event may trigger BEFORE batch draw is called
     // but as we have not hit canvas updated yet, it will trigger incorrect mouseover/mouseout events
     drawNodes.forEach((drawNode) => {
-      drawNode.draw();
+      if (drawNode.nodeType === 'Layer') {
+        // with partialRedraw only what the drag changed
+        (drawNode as Layer)._drawChanges();
+      } else {
+        drawNode.draw();
+      }
     });
   },
   _endDragAfter(evt, only?: DragElement) {

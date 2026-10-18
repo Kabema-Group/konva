@@ -198,6 +198,16 @@ export const Konva = {
   },
 };
 
+// Composite operations that change pixels outside of the painted shape, so
+// the bounds of the shape do not cover its effect
+export const _unboundedCompositeOperations = new Set<string>([
+  'source-in',
+  'source-out',
+  'destination-in',
+  'destination-atop',
+  'copy',
+]);
+
 // Konva's own shapes whose bounds cover everything they paint. Plugins can
 // import _registerNode, so they opt in explicitly.
 export const _boundedShapes = new Set<unknown>();

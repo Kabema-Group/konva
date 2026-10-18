@@ -12,7 +12,11 @@ import {
 } from './Validators.ts';
 
 import type { Context, SceneContext } from './Context.ts';
-import { _boundedShapes, _registerNode } from './Global.ts';
+import {
+  _boundedShapes,
+  _registerNode,
+  _unboundedCompositeOperations,
+} from './Global.ts';
 import * as PointerEvents from './PointerEvents.ts';
 
 import type { GetSet, Vector2d, IRect } from './types.ts';
@@ -626,6 +630,52 @@ export class Shape<
         transformed.height += y * 2;
       }
       return transformed;
+    }
+    return rect;
+  }
+  // bounds of the scene and hit drawing for partialRedraw, see Node._getPaintRect
+  _measurePaint(): IRect | null | undefined {
+    if (!this.visible()) return undefined;
+    if (this.isCached()) return this.getClientRect({ _forDrawing: true });
+    const bounded =
+      (!!this.attrs.selfRectFunc &&
+        this.getSelfRect === Shape.prototype.getSelfRect) ||
+      (!this.attrs.sceneFunc &&
+        !this.attrs.charRenderFunc &&
+        _boundedShapes.has(this.constructor));
+    if (
+      !bounded ||
+      (this.attrs.hitFunc && !this.attrs.selfRectFunc) ||
+      _unboundedCompositeOperations.has(this.globalCompositeOperation())
+    ) {
+      return null;
+    }
+    const rect = this.getClientRect({ _forDrawing: true });
+    const hitStrokeWidth = this.hitStrokeWidth();
+    if (
+      hitStrokeWidth !== 'auto' &&
+      this.hasHitStroke() &&
+      this.isListening()
+    ) {
+      // a hit stroke wider than the visible one reaches past the scene bounds
+      const strokeWidth = Math.abs(this.strokeWidth());
+      const sceneWidth = this.hasStroke() ? strokeWidth : 0;
+      const scale = this.strokeScaleEnabled()
+        ? this.getAbsoluteScale()
+        : { x: 1, y: 1 };
+      // how far joins and caps reach per unit of stroke width, as the shape
+      // pads its scene stroke
+      const joinFactor = strokeWidth
+        ? this._getStrokePadding() / (strokeWidth / 2)
+        : Math.max(Math.SQRT2, this.miterLimit() || 10);
+      const extra =
+        (Math.max(0, Math.abs(hitStrokeWidth) - sceneWidth) / 2) *
+        joinFactor *
+        Math.max(Math.abs(scale.x), Math.abs(scale.y));
+      rect.x -= extra;
+      rect.y -= extra;
+      rect.width += extra * 2;
+      rect.height += extra * 2;
     }
     return rect;
   }

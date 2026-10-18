@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](http://semver.org/).
 
+## Unreleased
+
+- Added `Layer.partialRedraw()`: a change of a node redraws only the area it painted before and paints now, instead of the whole layer, and nodes outside of that area are skipped. A frame then costs in proportion to the size of the change, not of the canvas. Dragging a shape or drawing a stroke among 150 shapes on a tablet-sized canvas at pixel ratio 2 drops from 43 ms to 7 ms per frame in WebKit, which rasterizes canvases on the CPU. Note: `draw()`, `batchDraw()` and `Konva.Animation` still redraw the whole layer. In Chrome, the antialiased edges of a large shape crossing a redrawn area can differ slightly until the next full draw
+- `Transformer` and the end of a drag no longer request a full layer redraw for their own updates, so they follow `partialRedraw()`
+
 ## 10.9.0 (2026-10-14)
 
 - Added `Konva.beginUpdateBatch()`: defers automatic `Transformer` updates across many synchronous node changes and runs them once when the returned function is called. A React commit or an undo that touches N selected nodes costs one update instead of N

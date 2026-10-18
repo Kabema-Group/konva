@@ -1,6 +1,7 @@
-import type { HitCanvas, SceneCanvas } from './Canvas.ts';
+import type { Canvas, HitCanvas, SceneCanvas } from './Canvas.ts';
 import type { SceneContext } from './Context.ts';
 import { Factory } from './Factory.ts';
+import { _unboundedCompositeOperations } from './Global.ts';
 import type { GetClientRectConfig, NodeConfig } from './Node.ts';
 import { Node } from './Node.ts';
 import type { Shape } from './Shape.ts';
@@ -83,6 +84,7 @@ export abstract class Container<
   }
   _clearChildren(dispose: 'remove' | 'destroy') {
     return Node._updateBatch(() => {
+      this._capturePaint();
       this.children.forEach((child) => {
         // reset parent to prevent many _setChildrenIndices calls
         child.parent = null;
@@ -132,8 +134,9 @@ export abstract class Container<
     this._fire('add', {
       child: child,
     });
+    child._capturePaint();
     this._notifySubtreeChange();
-    this._requestDraw();
+    this._requestDraw(false);
     // chainable
     return this;
   }
@@ -333,12 +336,44 @@ export abstract class Container<
       }
     }
   }
+  // the moved or removed child recorded its paint before the change
   _setChildrenIndices() {
     this.children?.forEach(function (child, n) {
       child.index = n;
     });
     this._notifySubtreeChange();
-    this._requestDraw();
+    this._requestDraw(false);
+  }
+  _measurePaint(epoch: object): IRect | null | undefined {
+    if (!this.visible()) return undefined;
+    if (this.isCached()) return this.getClientRect({ _forDrawing: true });
+    if (_unboundedCompositeOperations.has(this.globalCompositeOperation())) {
+      return null;
+    }
+    let rect: IRect | undefined;
+    for (const child of this.children) {
+      const childRect = child._getPaintRect(epoch);
+      if (childRect === null) return null;
+      if (!childRect) continue;
+      if (!rect) {
+        rect = { ...childRect };
+        continue;
+      }
+      const right = Math.max(
+          rect.x + rect.width,
+          childRect.x + childRect.width
+        ),
+        bottom = Math.max(rect.y + rect.height, childRect.y + childRect.height);
+      rect.x = Math.min(rect.x, childRect.x);
+      rect.y = Math.min(rect.y, childRect.y);
+      rect.width = right - rect.x;
+      rect.height = bottom - rect.y;
+    }
+    return rect;
+  }
+  _forgetPaint() {
+    this._paintEpoch = undefined;
+    for (const child of this.children) child._forgetPaint();
   }
   drawScene(can?: SceneCanvas, top?: Node) {
     const layer = this.getLayer()!,
@@ -437,7 +472,9 @@ export abstract class Container<
   }
 
   _drawChildNodes(drawMethod, canvas, top?: Node) {
+    const partial = (canvas as Canvas | undefined)?._partial;
     this.children?.forEach(function (child) {
+      if (partial && !child._paintsInto(partial)) return;
       child[drawMethod](canvas, top);
     });
   }
