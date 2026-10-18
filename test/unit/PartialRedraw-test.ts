@@ -345,6 +345,19 @@ describe('Layer partialRedraw', function () {
     assert.equal(layer.getIntersection({ x: 200, y: 80 }), null);
   });
 
+  it('adding and removing another layer does not redraw the layer', function () {
+    const { stage, layer, rect } = createScene();
+    let full = 0;
+    layer.on('draw', () => full++);
+    const other = new Konva.Layer();
+    stage.add(other);
+    other.destroy();
+    rect.fill('pink');
+    assert.isTrue(drawAndCompare(layer, 'after layer change'));
+    // the draw event fires for the partial draw and the full compare draw
+    assert.equal(full, 2);
+  });
+
   it('works at a fractional pixel ratio', function () {
     const { layer, rect, line } = createScene();
     layer.getCanvas().setPixelRatio(1.37);

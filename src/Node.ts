@@ -2524,6 +2524,12 @@ export abstract class Node<Config extends NodeConfig = NodeConfig> {
       if (layer?.partialRedraw()) {
         if (invalidate) layer._invalidate(this);
         layer._batchDrawChanges();
+      } else if (!layer && !invalidate && this.nodeType === 'Stage') {
+        // a layer was added, removed or reordered: an added layer draws
+        // itself and the other layers keep their pixels
+        for (const child of (this as unknown as Stage).children) {
+          if (!child.partialRedraw()) child.batchDraw();
+        }
       } else {
         (layer || this.getStage())?.batchDraw();
       }
